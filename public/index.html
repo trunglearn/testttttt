@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Market Maker Bot</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Market Maker Bot</h1>
+    <nav>
+      <a href="#" class="active">Volume</a>
+      <a href="#">Holders</a>
+      <a href="#">Bot X</a>
+    </nav>
+  </header>
+  <main>
+    <h2>Wallet and Contract Setup</h2>
+    <div id="chain-tabs">
+      <button class="tab active" data-chain="solana">Solana</button>
+      <button class="tab" data-chain="bnb">BNB</button>
+      <button class="tab" data-chain="sui" disabled>SUI</button>
+      <button class="tab" data-chain="tron" disabled>TRON</button>
+    </div>
+    <form id="setup-form">
+      <div id="mode-options"></div>
+      <label>Action</label>
+      <div>
+        <input type="radio" name="action" value="buy" checked> Buy
+        <input type="radio" name="action" value="sell"> Sell
+        <!-- Add more like Tx Spam -->
+        <input type="radio" name="action" value="txspam"> Tx Spam
+      </div>
+      <label>Import Wallets</label>
+      <input type="file" id="wallets-file">
+      <a href="/template" download>Download template</a>
+      <label>Base Token</label>
+      <span id="base-token"></span>
+      <label>Token Address</label>
+      <input type="text" name="tokenAddress" placeholder="Enter Coin Address">
+      <label>Max Base Amount</label>
+      <input type="number" name="maxBaseAmount" placeholder="Enter Max Amount">
+      <label>Schedule</label>
+      <select name="schedule">
+        <option>Every minute</option>
+        <option>Every hour</option>
+      </select>
+      <!-- Additional fields like Volume % Balance slider -->
+      <label>Volume % Balance</label>
+      <input type="range" name="volumePercent" min="0" max="100" value="100">
+      <div id="additional-fields"></div>
+      <button type="submit">Submit</button>
+      <button type="button" id="pause-btn">Cancel (Pause)</button>
+    </form>
+  </main>
+  <script src="script.js"></script>
+</body>
+</html>
