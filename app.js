@@ -7,8 +7,11 @@ const path = require('path');
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
+
 const SolanaProvider = require('./providers/solana');
 const BnbProvider = require('./providers/bnb');
+const { isValidSolanaSecretKey } = require('./utils/solanaUtils');
+const { PublicKey } = require('@solana/web3.js');
 
 let botState = {
   running: false,
@@ -48,12 +51,27 @@ app.post('/setup', upload.single('wallets'), async (req, res) => {
     return res.status(400).json({ error: 'Wallets file required' });
   }
 
+  // Kiểm tra tokenAddress hợp lệ cho Solana
+  if (chain === 'solana') {
+    try {
+      new PublicKey(tokenAddress);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid tokenAddress for Solana' });
+    }
+  }
+
   // Parse CSV for wallets
   const wallets = [];
   fs.createReadStream(file.path)
     .pipe(csv())
     .on('data', (row) => {
-      if (row.privateKey) wallets.push(row.privateKey);
+      if (row.privateKey) {
+        if (chain === 'solana' && !isValidSolanaSecretKey(row.privateKey)) {
+          console.warn(`Invalid Solana secret key skipped: ${row.privateKey}`);
+          return;
+        }
+        wallets.push(row.privateKey);
+      }
     })
     .on('end', async () => {
       fs.unlinkSync(file.path); // Cleanup
