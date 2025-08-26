@@ -17,6 +17,8 @@ import { createJupiterApiClient } from "@jup-ag/api";
 import {
     getAssociatedTokenAddress,
     createAssociatedTokenAccountInstruction,
+    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID
 } from "@solana/spl-token";
 
 const app = express();
@@ -69,15 +71,23 @@ function parseWalletFile(buffer, originalname) {
     throw new Error("Unsupported file format (chỉ hỗ trợ .csv hoặc .xlsx)");
 }
 
+// Get token program ID by fetching mint owner
+async function getTokenProgramId(mintStr) {
+    const mint = new PublicKey(mintStr);
+    const mintInfo = await connection.getAccountInfo(mint);
+    if (!mintInfo) throw new Error(`Mint ${mintStr} not found`);
+    return mintInfo.owner;
+}
 
 // Ensure ATA exists (create if missing) for a given owner+mint
 async function ensureAta(ownerKp, mintStr) {
     const mint = new PublicKey(mintStr);
     const owner = ownerKp.publicKey;
-    const ata = await getAssociatedTokenAddress(mint, owner);
+    const programId = await getTokenProgramId(mintStr);
+    const ata = await getAssociatedTokenAddress(mint, owner, false, programId);
     const info = await connection.getAccountInfo(ata);
     if (!info) {
-        const ix = createAssociatedTokenAccountInstruction(owner, ata, owner, mint);
+        const ix = createAssociatedTokenAccountInstruction(owner, ata, owner, mint, programId);
         const { blockhash } = await connection.getLatestBlockhash();
         const msg = new TransactionMessage({
             payerKey: owner,
@@ -172,6 +182,7 @@ async function processWallet({
                 quoteResponse: quote,
                 userPublicKey: owner,
                 wrapAndUnwrapSol: true,
+                useTokenLedger: true, // Added to handle Token-2022 tokens properly
                 // prioritizationFeeLamports: "auto", // có thể bật khi cần
             },
         });
