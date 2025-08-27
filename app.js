@@ -1,121 +1,127 @@
+// index.js
+require('dotenv').config();
 const express = require('express');
-const multer = require('multer');
 const fs = require('fs');
-const csv = require('csv-parser');
-const cron = require('node-cron');
-const path = require('path');
+const bs58 = require('bs58');
+const axios = require('axios');
+const { Connection, Keypair, Transaction, VersionedTransaction, sendAndConfirmTransaction } = require('@solana/web3.js');
+const raydiumSdk = require('@raydium-io/raydium-sdk-v2'); // to use API_URLS etc
+const { API_URLS } = raydiumSdk;
+
 const app = express();
-const upload = multer({ dest: 'uploads/' });
-
-
-const SolanaProvider = require('./providers/solana');
-const BnbProvider = require('./providers/bnb');
-const { isValidSolanaSecretKey } = require('./utils/solanaUtils');
-const { PublicKey } = require('@solana/web3.js');
-
-let botState = {
-  running: false,
-  task: null,
-  providers: {},
-};
-
-// Middleware
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
-// Root route for frontend
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+const RPC = process.env.RPC || 'https://api.devnet.solana.com';
+const connection = new Connection(RPC, 'confirmed');
+
+function loadKeypair(path) {
+  const raw = JSON.parse(fs.readFileSync(path, 'utf8'));
+  return Keypair.fromSecretKey(new Uint8Array(raw));
+}
+const payer = loadKeypair(process.env.KEYPAIR_PATH);
+
+app.get('/status', async (req, res) => {
+  try {
+    const lamports = await connection.getBalance(payer.publicKey);
+    res.json({ pubkey: payer.publicKey.toBase58(), lamports });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Download wallet template
-app.get('/template', (req, res) => {
-  const template = 'privateKey\nyour_private_key_here\n';
-  res.set('Content-Type', 'text/csv');
-  res.set('Content-Disposition', 'attachment; filename=wallets_template.csv');
-  res.send(template);
-});
+/**
+ * POST /swap
+ * body: {
+ *   inputMint: string (mint address, use NATIVE_MINT for SOL?),
+ *   outputMint: string,
+ *   amount: string or number (base units, e.g. 1 token with 6 decimals -> 1000000),
+ *   slippageBps: number (e.g. 50 for 0.5%),
+ *   inputAccount?: string (if inputMint != SOL you MUST pass ATA address for your input token)
+ * }
+ */
+app.post('/swap', async (req, res) => {
+  try {
+    const { inputMint, outputMint, amount, slippageBps = 50, inputAccount, txVersion = 'V0' } = req.body;
 
-// Setup endpoint
-app.post('/setup', upload.single('wallets'), async (req, res) => {
-  const { chain, action, tokenAddress, maxBaseAmount, schedule, mode } = req.body; // Added mode for variations like presale, tx spam
-  const file = req.file;
-
-  if (!['solana', 'bnb'].includes(chain)) {
-    return res.status(400).json({ error: 'Unsupported chain' });
-  }
-  if (!action) {
-    return res.status(400).json({ error: 'Action required' });
-  }
-  if (!file) {
-    return res.status(400).json({ error: 'Wallets file required' });
-  }
-
-  // Kiểm tra tokenAddress hợp lệ cho Solana
-  if (chain === 'solana') {
-    try {
-      new PublicKey(tokenAddress);
-    } catch (e) {
-      return res.status(400).json({ error: 'Invalid tokenAddress for Solana' });
+    // validation
+    if (!inputMint || !outputMint || !amount) return res.status(400).json({ error: 'inputMint, outputMint, amount required' });
+    // if input token is not SOL, inputAccount must be provided (Trade API requirement)
+    const NATIVE_MINT = 'So11111111111111111111111111111111111111112';
+    if (inputMint !== NATIVE_MINT && !inputAccount) {
+      return res.status(400).json({ error: 'inputAccount is required when inputMint is not SOL (ATA address)' });
     }
+
+    // 1) Get priority fee suggested by Raydium (optional but recommended)
+    const priorityFeeUrl = `${API_URLS.BASE_HOST}${API_URLS.PRIORITY_FEE}`;
+    let computeUnitPriceMicroLamports = '0';
+    try {
+      const feeResp = await axios.get(priorityFeeUrl);
+      computeUnitPriceMicroLamports = String(feeResp.data?.data?.default?.h || feeResp.data?.data?.default?.m || 0);
+    } catch (e) {
+      // continue with 0 (dev/test)
+      computeUnitPriceMicroLamports = '0';
+    }
+
+    // 2) Compute route (GET compute/swap-base-in)
+    const SWAP_HOST = API_URLS.SWAP_HOST; // usually https://transaction-v1.raydium.io
+    const computeUrl = `${SWAP_HOST}${API_URLS.SWAP_COMPUTE}swap-base-in?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&txVersion=${txVersion}`;
+    const computeResp = await axios.get(computeUrl);
+    if (!computeResp.data) return res.status(500).json({ error: 'no compute response' });
+    const swapResponse = computeResp.data;
+
+    // 3) Ask Raydium to build transactions (POST /transaction/swap-base-in)
+    const txBuildUrl = `${SWAP_HOST}${API_URLS.SWAP_TX}swap-base-in`;
+    const postBody = {
+      computeUnitPriceMicroLamports,
+      swapResponse,
+      txVersion,
+      wallet: payer.publicKey.toBase58(),
+      wrapSol: inputMint === NATIVE_MINT,
+      unwrapSol: outputMint === NATIVE_MINT,
+      inputAccount: inputMint === NATIVE_MINT ? undefined : inputAccount,
+      // outputAccount optional: SDK will default to ATA if possible
+    };
+    const txBuildResp = await axios.post(txBuildUrl, postBody);
+    if (!txBuildResp.data || !txBuildResp.data.data) return res.status(500).json({ error: 'no tx build response' });
+
+    // 4) Deserialize transactions (base64) -> sign -> send -> confirm
+    const txArray = txBuildResp.data.data; // array of { transaction: base64, ... } usually
+    const allTxBufs = txArray.map(item => Buffer.from(item.transaction, 'base64'));
+    const results = [];
+
+    for (let i = 0; i < allTxBufs.length; i++) {
+      const buf = allTxBufs[i];
+
+      if (txVersion === 'V0') {
+        // VersionedTransaction
+        const tx = VersionedTransaction.deserialize(buf);
+        // sign with owner
+        tx.sign([payer]);
+        // send raw
+        const raw = tx.serialize();
+        const signature = await connection.sendRawTransaction(raw, { skipPreflight: true });
+        // confirm using latest blockhash pattern
+        const { lastValidBlockHeight, blockhash } = await connection.getLatestBlockhash('finalized');
+        await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature }, 'confirmed');
+        results.push({ idx: i, signature });
+      } else {
+        // legacy Transaction
+        const tx = Transaction.from(buf);
+        tx.sign(payer);
+        const txid = await sendAndConfirmTransaction(connection, tx, [payer], { skipPreflight: true });
+        results.push({ idx: i, txid });
+      }
+    }
+
+    res.json({ success: true, results });
+  } catch (e) {
+    console.error('swap error', e?.response?.data || e.message);
+    res.status(500).json({ error: e?.response?.data || e.message });
   }
-
-  // Parse CSV for wallets
-  const wallets = [];
-  fs.createReadStream(file.path)
-    .pipe(csv())
-    .on('data', (row) => {
-      if (row.privateKey) {
-        if (chain === 'solana' && !isValidSolanaSecretKey(row.privateKey)) {
-          console.warn(`Invalid Solana secret key skipped: ${row.privateKey}`);
-          return;
-        }
-        wallets.push(row.privateKey);
-      }
-    })
-    .on('end', async () => {
-      fs.unlinkSync(file.path); // Cleanup
-
-      let provider;
-      if (chain === 'solana') {
-        provider = new SolanaProvider();
-      } else if (chain === 'bnb') {
-        provider = new BnbProvider();
-      }
-
-      await provider.loadWallets(wallets);
-      botState.providers[chain] = provider;
-
-      // Stop existing task
-      if (botState.task) botState.task.stop();
-      botState.running = true;
-
-      // Schedule based on input (e.g., 'every minute' -> '* * * * *')
-      let cronSchedule = '* * * * *'; // Default every minute
-      if (schedule === 'every hour') cronSchedule = '0 * * * *';
-      // Add more schedule options as needed
-
-      botState.task = cron.schedule(cronSchedule, async () => {
-        if (!botState.running) return;
-        try {
-          await provider.performAction(action, tokenAddress, parseFloat(maxBaseAmount), mode);
-          console.log(`Action ${action} performed on ${chain}`);
-        } catch (err) {
-          console.error('Error in scheduled task:', err);
-        }
-      });
-
-      res.json({ message: 'Bot setup complete and started' });
-    });
 });
 
-// Pause endpoint
-app.post('/pause', (req, res) => {
-  botState.running = false;
-  if (botState.task) botState.task.stop();
-  res.json({ message: 'Bot paused' });
-});
-
-app.listen(3000, () => {
-  console.log('Server running on port 3000');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Raydium trade backend running on ${PORT}`);
 });
